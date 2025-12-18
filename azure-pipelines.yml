@@ -2,72 +2,56 @@ trigger:
 - master
 
 pool:
-  vmImage: ubuntu-latest
+  name: Default
 
 steps:
 
-# -------------------------------
-# 1. Install PHP manually
-# -------------------------------
+# 1. Verify agent is working
+- script: echo "Pipeline running on self-hosted agent"
+  displayName: Agent check
+
+# 2. Update system
+- script: sudo apt-get update
+  displayName: Update system
+
+# 3. Install PHP and required extensions
 - script: |
-    sudo apt-get update
-    sudo apt-get install -y php php-cli php-mbstring php-xml unzip curl git
+    sudo apt-get install -y \
+    php php-cli php-mbstring php-xml php-curl php-zip unzip curl git
     php -v
   displayName: Install PHP
 
-# -------------------------------
-# 2. Install pip (for Semgrep)
-# -------------------------------
-- script: sudo apt-get install -y python3-pip
-  displayName: Install Python3 pip
-
-# -------------------------------
-# 3. Install Composer
-# -------------------------------
+# 4. Install Composer
 - script: |
     curl -sS https://getcomposer.org/installer | php
     sudo mv composer.phar /usr/local/bin/composer
     composer --version
   displayName: Install Composer
 
-# -------------------------------
-# 4. Install PHP dependencies
-# -------------------------------
+# 5. Install project dependencies
 - script: composer install
   displayName: Install PHP dependencies
 
-# -------------------------------
-# 5. Check PHP
-# -------------------------------
-- script: php -v
-  displayName: Check PHP version
-
-# -------------------------------
-# 6. Dependency security scan
-# -------------------------------
+# 6. Dependency Security Scan (SCA)
 - script: composer audit || true
   displayName: Dependency security scan
 
-# -------------------------------
-# 7. Static code scan (SAST)
-# -------------------------------
+# 7. Static Code Security Scan (SAST)
 - script: |
     pip3 install semgrep
     semgrep --config=auto || true
   displayName: Static code security scan
 
-# -------------------------------
 # 8. Create build artifact
-# -------------------------------
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: .
     archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
+  displayName: Create build artifact
 
-# -------------------------------
-# 9. Publish build artifact
-# -------------------------------
+# 9. Publish artifact
 - task: PublishBuildArtifacts@1
   inputs:
     PathtoPublish: $(Build.ArtifactStagingDirectory)
-    ArtifactName: build
+    ArtifactName: akaunting-build
+  displayName: Publish artifact
