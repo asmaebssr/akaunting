@@ -1,0 +1,73 @@
+trigger:
+- master
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+
+# -------------------------------
+# 1. Install PHP manually
+# -------------------------------
+- script: |
+    sudo apt-get update
+    sudo apt-get install -y php php-cli php-mbstring php-xml unzip curl git
+    php -v
+  displayName: Install PHP
+
+# -------------------------------
+# 2. Install pip (for Semgrep)
+# -------------------------------
+- script: sudo apt-get install -y python3-pip
+  displayName: Install Python3 pip
+
+# -------------------------------
+# 3. Install Composer
+# -------------------------------
+- script: |
+    curl -sS https://getcomposer.org/installer | php
+    sudo mv composer.phar /usr/local/bin/composer
+    composer --version
+  displayName: Install Composer
+
+# -------------------------------
+# 4. Install PHP dependencies
+# -------------------------------
+- script: composer install
+  displayName: Install PHP dependencies
+
+# -------------------------------
+# 5. Check PHP
+# -------------------------------
+- script: php -v
+  displayName: Check PHP version
+
+# -------------------------------
+# 6. Dependency security scan
+# -------------------------------
+- script: composer audit || true
+  displayName: Dependency security scan
+
+# -------------------------------
+# 7. Static code scan (SAST)
+# -------------------------------
+- script: |
+    pip3 install semgrep
+    semgrep --config=auto || true
+  displayName: Static code security scan
+
+# -------------------------------
+# 8. Create build artifact
+# -------------------------------
+- task: ArchiveFiles@2
+  inputs:
+    rootFolderOrFile: .
+    archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
+
+# -------------------------------
+# 9. Publish build artifact
+# -------------------------------
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: $(Build.ArtifactStagingDirectory)
+    ArtifactName: build
