@@ -6,50 +6,60 @@ pool:
 
 steps:
 
-# 1. Verify agent is working
+# 0. Increase Git buffer (FIXES RPC / EOF error)
+- script: git config --global http.postBuffer 524288000
+  displayName: Fix Git buffer
+
+# 1. Checkout source (shallow clone)
+- checkout: self
+  clean: true
+  fetchDepth: 1
+  displayName: Checkout repository
+
+# 2. Verify agent
 - script: echo "Pipeline running on self-hosted agent"
   displayName: Agent check
 
-# 2. Update system
+# 3. Update system
 - script: sudo apt-get update
   displayName: Update system
 
-# 3. Install PHP and required extensions
+# 4. Install PHP & extensions
 - script: |
     sudo apt-get install -y \
-    php php-cli php-mbstring php-xml php-curl php-zip unzip curl git
+    php php-cli php-mbstring php-xml php-curl php-zip unzip curl git python3-pip
     php -v
   displayName: Install PHP
 
-# 4. Install Composer
+# 5. Install Composer
 - script: |
     curl -sS https://getcomposer.org/installer | php
     sudo mv composer.phar /usr/local/bin/composer
     composer --version
   displayName: Install Composer
 
-# 5. Install project dependencies
-- script: composer install
-  displayName: Install PHP dependencies
+# 6. Install PHP dependencies
+- script: composer install --no-interaction --no-progress
+  displayName: Install dependencies
 
-# 6. Dependency Security Scan (SCA)
+# 7. SCA – Dependency security scan
 - script: composer audit || true
-  displayName: Dependency security scan
+  displayName: Dependency security scan (SCA)
 
-# 7. Static Code Security Scan (SAST)
+# 8. SAST – Static code scan
 - script: |
     pip3 install semgrep
     semgrep --config=auto || true
-  displayName: Static code security scan
+  displayName: Static security scan (SAST)
 
-# 8. Create build artifact
+# 9. Create artifact
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: .
     archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
   displayName: Create build artifact
 
-# 9. Publish artifact
+# 10. Publish artifact
 - task: PublishBuildArtifacts@1
   inputs:
     PathtoPublish: $(Build.ArtifactStagingDirectory)
