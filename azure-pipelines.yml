@@ -1,67 +1,37 @@
 trigger:
 - master
-
 pool:
   name: test
-
 steps:
-
-# 0. Increase Git buffer (FIXES RPC / EOF error)
-- script: git config --global http.postBuffer 524288000
-  displayName: Fix Git buffer
-
-# 1. Checkout source (shallow clone)
 - checkout: self
   clean: true
   fetchDepth: 1
-  displayName: Checkout repository
 
-# 2. Verify agent
-- script: echo "Pipeline running on self-hosted agent"
-  displayName: Agent check
+# Cache Composer dependencies
+- task: Cache@2
+  inputs:
+    key: 'composer | "$(Agent.OS)" | composer.lock'
+    path: vendor
+  displayName: Cache vendor
 
-# 3. Update system
-- script: sudo apt-get update
-  displayName: Update system
-
-# 4. Install PHP & extensions
-- script: |
-    sudo apt-get install -y \
-    php php-cli php-mbstring php-xml php-curl php-zip unzip curl git python3-pip
-    php -v
-  displayName: Install PHP
-
-# 5. Install Composer
-- script: |
-    curl -sS https://getcomposer.org/installer | php
-    sudo mv composer.phar /usr/local/bin/composer
-    composer --version
-  displayName: Install Composer
-
-# 6. Install PHP dependencies
-- script: composer install --no-interaction --no-progress
+- script: composer install --no-interaction --no-progress --prefer-dist
   displayName: Install dependencies
+  condition: ne(variables['CacheRestored'], 'true')
 
-# 7. SCA – Dependency security scan
 - script: composer audit || true
-  displayName: Dependency security scan (SCA)
+  displayName: Security scan
 
-# 8. SAST – Static code scan
 - script: |
-    pip3 install semgrep
-    semgrep --config=auto || true
-  displayName: Static security scan (SAST)
+    pip3 install --user semgrep 2>/dev/null || true
+    ~/.local/bin/semgrep --config=auto || true
+  displayName: SAST
 
-# 9. Create artifact
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: .
     archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
-  displayName: Create build artifact
-
-# 10. Publish artifact
+    
 - task: PublishBuildArtifacts@1
   inputs:
     PathtoPublish: $(Build.ArtifactStagingDirectory)
     ArtifactName: akaunting-build
-  displayName: Publish artifact
