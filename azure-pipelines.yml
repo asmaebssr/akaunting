@@ -1,70 +1,270 @@
 trigger:
-- master
+  - master
+
 pool:
   name: test
-steps:
-# 1. Checkout source
-- checkout: self
-  clean: true
-  fetchDepth: 1
-  displayName: Checkout repository
 
-# 2. Update system packages
-- script: sudo apt-get update
-  displayName: Update package lists
+variables:
+  phpVersion: '8.3'
+  appName: 'akaunting-app'
 
-# 3. Install PHP with ALL required extensions
-- script: |
-    sudo apt-get install -y \
-      php php-cli php-mbstring php-xml php-curl php-zip \
-      php-bcmath php-intl php-gd \
-      unzip curl git python3-pip
-    php -v
-    echo "Installed extensions:"
-    php -m | grep -E 'bcmath|intl|gd|mbstring|xml|curl|zip'
-  displayName: Install PHP with extensions
+stages:
+# ============================================
+# STAGE 1: BUILD & TEST
+# ============================================
+- stage: Build
+  displayName: 'Build & Security Scan'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build Application'
+    steps:
+    # Checkout
+    - checkout: self
+      clean: true
+      fetchDepth: 1
+      displayName: 'Checkout code'
 
-# 4. Install Composer
-- script: |
-    curl -sS https://getcomposer.org/installer | php
-    sudo mv composer.phar /usr/local/bin/composer
-    composer --version
-  displayName: Install Composer
+    # System setup
+    - script: sudo apt-get update
+      displayName: 'Update package lists'
 
-# 5. Cache Composer dependencies
-- task: Cache@2
-  inputs:
-    key: 'composer | "$(Agent.OS)" | composer.lock'
-    path: vendor
-  displayName: Cache vendor directory
+    # Install PHP with extensions
+    - script: |
+        sudo apt-get install -y \
+          php php-cli php-mbstring php-xml php-curl php-zip \
+          php-bcmath php-intl php-gd php-mysql \
+          unzip curl git python3-pip
+        php -v
+        php -m | grep -E 'bcmath|intl|gd'
+      displayName: 'Install PHP & Extensions'
 
-# 6. Install PHP dependencies
-- script: composer install --no-interaction --no-progress --prefer-dist
-  displayName: Install dependencies
-  condition: ne(variables['CacheRestored'], 'true')
+    # Install Composer
+    - script: |
+        curl -sS https://getcomposer.org/installer | php
+        sudo mv composer.phar /usr/local/bin/composer
+        composer --version
+      displayName: 'Install Composer'
 
-# 7. Security scans
-- script: composer audit || true
-  displayName: Dependency security scan (SCA)
+    # Cache dependencies
+    - task: Cache@2
+      inputs:
+        key: 'composer | "$(Agent.OS)" | composer.lock'
+        path: vendor
+      displayName: 'Cache Composer packages'
 
-- script: |
-    pip3 install --user semgrep
-    ~/.local/bin/semgrep --config=auto || true
-  displayName: Static security scan (SAST)
+    # Install dependencies
+    - script: composer install --no-interaction --no-progress --prefer-dist
+      displayName: 'Install PHP dependencies'
 
-# 8. Create and publish artifact
-- task: ArchiveFiles@2
-  inputs:
-    rootFolderOrFile: .
-    archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
-    excludePaths: |
-      .git
-      .azure-pipelines
-      tests
-  displayName: Create build artifact
+    # Run unit tests
+    - script: |
+        cp .env.example .env
+        php artisan key:generate
+        vendor/bin/phpunit --log-junit test-results.xml || true
+      displayName: 'Run Unit Tests'
 
-- task: PublishBuildArtifacts@1
-  inputs:
-    PathtoPublish: $(Build.ArtifactStagingDirectory)
-    ArtifactName: akaunting-build
-  displayName: Publish artifact
+    # Publish test results
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'test-results.xml'
+        failTaskOnFailedTests: false
+      displayName: 'Publish Test Results'
+      condition: always()
+
+# ============================================
+# STAGE 2: SECURITY SCANNING (DevSecOps)
+# ============================================
+- stage: Security
+  displayName: 'Security Scanning'
+  dependsOn: Build
+  jobs:
+  - job: SecurityScans
+    displayName: 'Run Security Scans'
+    steps:
+    - checkout: self
+      displayName: 'Checkout code'
+
+    # Install tools
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y php php-cli php-mbstring php-xml curl git python3-pip
+        curl -sS https://getcomposer.org/installer | php
+        sudo mv composer.phar /usr/local/bin/composer
+      displayName: 'Setup environment'
+
+    # Restore dependencies
+    - task: Cache@2
+      inputs:
+        key: 'composer | "$(Agent.OS)" | composer.lock'
+        path: vendor
+    - script: composer install --no-interaction --no-progress
+      displayName: 'Restore dependencies'
+
+    # 1. SCA - Dependency Check
+    - script: |
+        echo "=== Composer Security Audit ==="
+        composer audit --format=json > composer-audit.json || true
+        cat composer-audit.json
+      displayName: '🔍 SCA - Dependency Vulnerability Scan'
+      continueOnError: true
+
+    # 2. SAST - Static Code Analysis
+    - script: |
+        echo "=== Installing Semgrep ==="
+        pip3 install semgrep
+        echo "=== Running Semgrep SAST ==="
+        ~/.local/bin/semgrep --config=auto --json --output=semgrep-results.json || true
+        cat semgrep-results.json
+      displayName: '🔍 SAST - Static Application Security Testing'
+      continueOnError: true
+
+    # 3. Secret Scanning
+    - script: |
+        echo "=== Installing Gitleaks ==="
+        wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
+        tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
+        echo "=== Scanning for secrets ==="
+        ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || true
+        cat gitleaks-report.json
+      displayName: '🔍 Secret Scanning'
+      continueOnError: true
+
+    # 4. Code Quality
+    - script: |
+        echo "=== Installing PHP_CodeSniffer ==="
+        composer require --dev squizlabs/php_codesniffer
+        echo "=== Running Code Quality Check ==="
+        vendor/bin/phpcs --standard=PSR12 --report=json --report-file=phpcs-report.json app/ || true
+      displayName: '🔍 Code Quality Analysis'
+      continueOnError: true
+
+    # Publish security reports
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '.'
+        ArtifactName: 'security-reports'
+        publishLocation: 'Container'
+        includeRootFolder: false
+        StoreAsTar: false
+        parallel: true
+        filesFilter: |
+          composer-audit.json
+          semgrep-results.json
+          gitleaks-report.json
+          phpcs-report.json
+      displayName: 'Publish Security Reports'
+
+# ============================================
+# STAGE 3: DOCKER BUILD & CONTAINER SCANNING
+# ============================================
+- stage: Containerize
+  displayName: 'Docker Build & Scan'
+  dependsOn: Security
+  jobs:
+  - job: DockerBuild
+    displayName: 'Build & Scan Docker Image'
+    steps:
+    - checkout: self
+
+    # Build Docker image
+    - script: |
+        cat > Dockerfile << 'EOF'
+        FROM php:8.3-apache
+        
+        # Install dependencies
+        RUN apt-get update && apt-get install -y \
+            libpng-dev libjpeg-dev libfreetype6-dev \
+            libzip-dev libicu-dev libonig-dev \
+            git unzip curl \
+            && docker-php-ext-configure gd --with-freetype --with-jpeg \
+            && docker-php-ext-install -j$(nproc) \
+            bcmath gd intl mbstring pdo pdo_mysql zip
+        
+        # Enable Apache modules
+        RUN a2enmod rewrite
+        
+        # Copy application
+        COPY . /var/www/html
+        WORKDIR /var/www/html
+        
+        # Install Composer
+        COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+        RUN composer install --no-dev --optimize-autoloader
+        
+        # Set permissions
+        RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+        
+        EXPOSE 80
+        CMD ["apache2-foreground"]
+        EOF
+        
+        docker build -t $(appName):$(Build.BuildId) .
+      displayName: 'Build Docker Image'
+
+    # Container security scan with Trivy
+    - script: |
+        echo "=== Installing Trivy ==="
+        wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
+        sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
+        
+        echo "=== Scanning Docker image ==="
+        trivy image --format json --output trivy-report.json $(appName):$(Build.BuildId) || true
+        trivy image $(appName):$(Build.BuildId)
+      displayName: '🔍 Container Security Scan (Trivy)'
+      continueOnError: true
+
+    # Save Docker image
+    - script: |
+        docker save $(appName):$(Build.BuildId) -o $(Build.ArtifactStagingDirectory)/akaunting-image.tar
+      displayName: 'Save Docker Image'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'docker-image'
+      displayName: 'Publish Docker Image'
+
+# ============================================
+# STAGE 4: DEPLOYMENT
+# ============================================
+- stage: Deploy
+  displayName: 'Deploy to Azure'
+  dependsOn: Containerize
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  jobs:
+  - deployment: DeployToAzure
+    displayName: 'Deploy Application'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: docker-image
+          
+          # Load Docker image
+          - script: |
+              docker load -i $(Pipeline.Workspace)/docker-image/akaunting-image.tar
+            displayName: 'Load Docker Image'
+          
+          # Deploy to Azure Container Instances (example)
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: 'YOUR_AZURE_SERVICE_CONNECTION'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Push to Azure Container Registry
+                az acr login --name YOUR_ACR_NAME
+                docker tag $(appName):$(Build.BuildId) YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId)
+                docker push YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId)
+                
+                # Deploy to Azure Container Instance
+                az container create \
+                  --resource-group YOUR_RESOURCE_GROUP \
+                  --name $(appName) \
+                  --image YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId) \
+                  --dns-name-label $(appName)-prod \
+                  --ports 80
+            displayName: 'Deploy to Azure'
