@@ -72,6 +72,23 @@ stages:
       displayName: 'Publish Test Results'
       condition: always()
 
+    # Create application archive
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+        includeRootFolder: false
+        archiveType: 'tar'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
+        replaceExistingArchive: true
+      displayName: 'Create application archive'
+
+    # Publish application artifact
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'app-files'
+      displayName: 'Publish application files'
+
 # ============================================
 # STAGE 2: SECURITY SCANNING (DevSecOps)
 # ============================================
@@ -88,7 +105,7 @@ stages:
     # Install tools
     - script: |
         sudo apt-get update
-        sudo apt-get install -y php php-cli php-mbstring php-xml curl git python3-pip
+        sudo apt-get install -y php php-cli php-mbstring php-xml php-bcmath php-intl php-gd curl git python3-pip
         curl -sS https://getcomposer.org/installer | php
         sudo mv composer.phar /usr/local/bin/composer
       displayName: 'Setup environment'
@@ -148,11 +165,6 @@ stages:
         includeRootFolder: false
         StoreAsTar: false
         parallel: true
-        filesFilter: |
-          composer-audit.json
-          semgrep-results.json
-          gitleaks-report.json
-          phpcs-report.json
       displayName: 'Publish Security Reports'
 
 # ============================================
@@ -200,6 +212,7 @@ stages:
         EOF
         
         docker build -t $(appName):$(Build.BuildId) .
+        docker tag $(appName):$(Build.BuildId) $(appName):latest
       displayName: 'Build Docker Image'
 
     # Container security scan with Trivy
@@ -214,9 +227,16 @@ stages:
       displayName: '🔍 Container Security Scan (Trivy)'
       continueOnError: true
 
-    # Save Docker image
+    # Publish Trivy report
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: 'trivy-report.json'
+        ArtifactName: 'container-security-report'
+      displayName: 'Publish Trivy Report'
+
+    # Save Docker image as tar
     - script: |
-        docker save $(appName):$(Build.BuildId) -o $(Build.ArtifactStagingDirectory)/akaunting-image.tar
+        docker save $(appName):$(Build.BuildId) | gzip > $(Build.ArtifactStagingDirectory)/docker-image.tar.gz
       displayName: 'Save Docker Image'
 
     - task: PublishBuildArtifacts@1
@@ -226,7 +246,7 @@ stages:
       displayName: 'Publish Docker Image'
 
 # ============================================
-# STAGE 4: DEPLOYMENT
+# STAGE 4: DEPLOYMENT TO AZURE WEB APP
 # ============================================
 - stage: Deploy
   displayName: 'Deploy to Azure'
@@ -234,7 +254,7 @@ stages:
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
   jobs:
   - deployment: DeployToAzure
-    displayName: 'Deploy Application'
+    displayName: 'Deploy to Azure Web App'
     environment: 'production'
     strategy:
       runOnce:
@@ -243,28 +263,77 @@ stages:
           - download: current
             artifact: docker-image
           
-          # Load Docker image
-          - script: |
-              docker load -i $(Pipeline.Workspace)/docker-image/akaunting-image.tar
-            displayName: 'Load Docker Image'
+          - download: current
+            artifact: app-files
           
-          # Deploy to Azure Container Instances (example)
+          # Deploy using Azure Web App for Containers
           - task: AzureCLI@2
             inputs:
-              azureSubscription: 'YOUR_AZURE_SERVICE_CONNECTION'
+              azureSubscription: 'azure-akaunting-connection'
               scriptType: 'bash'
               scriptLocation: 'inlineScript'
               inlineScript: |
-                # Push to Azure Container Registry
-                az acr login --name YOUR_ACR_NAME
-                docker tag $(appName):$(Build.BuildId) YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId)
-                docker push YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId)
+                RESOURCE_GROUP="akaunting-rg"
+                APP_NAME="akaunting-webapp-$(Build.BuildId)"
+                LOCATION="eastus"
                 
-                # Deploy to Azure Container Instance
-                az container create \
-                  --resource-group YOUR_RESOURCE_GROUP \
-                  --name $(appName) \
-                  --image YOUR_ACR_NAME.azurecr.io/$(appName):$(Build.BuildId) \
-                  --dns-name-label $(appName)-prod \
-                  --ports 80
-            displayName: 'Deploy to Azure'
+                echo "=========================================="
+                echo "Creating Azure App Service Plan..."
+                echo "=========================================="
+                
+                # Create App Service Plan (Linux, Free tier)
+                az appservice plan create \
+                  --name "${APP_NAME}-plan" \
+                  --resource-group $RESOURCE_GROUP \
+                  --location $LOCATION \
+                  --is-linux \
+                  --sku F1 || true
+                
+                echo "=========================================="
+                echo "Creating Web App..."
+                echo "=========================================="
+                
+                # Create Web App with PHP 8.3 runtime
+                az webapp create \
+                  --resource-group $RESOURCE_GROUP \
+                  --plan "${APP_NAME}-plan" \
+                  --name $APP_NAME \
+                  --runtime "PHP:8.3"
+                
+                echo "=========================================="
+                echo "Configuring Web App..."
+                echo "=========================================="
+                
+                # Configure app settings
+                az webapp config appsettings set \
+                  --resource-group $RESOURCE_GROUP \
+                  --name $APP_NAME \
+                  --settings \
+                    APP_ENV=production \
+                    APP_DEBUG=false \
+                    WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
+                
+                # Extract and deploy application files
+                cd $(Pipeline.Workspace)/app-files
+                tar -xzf app.tar.gz -C /tmp/app-deploy
+                
+                # Deploy using ZIP deploy
+                cd /tmp/app-deploy
+                zip -r deploy.zip .
+                
+                az webapp deployment source config-zip \
+                  --resource-group $RESOURCE_GROUP \
+                  --name $APP_NAME \
+                  --src deploy.zip
+                
+                # Get the app URL
+                APP_URL=$(az webapp show \
+                  --resource-group $RESOURCE_GROUP \
+                  --name $APP_NAME \
+                  --query defaultHostName -o tsv)
+                
+                echo "=========================================="
+                echo "✅ Application deployed successfully!"
+                echo "Access your app at: https://$APP_URL"
+                echo "=========================================="
+            displayName: 'Deploy to Azure Web App'
