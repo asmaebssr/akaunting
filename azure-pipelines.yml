@@ -3,35 +3,68 @@ trigger:
 pool:
   name: test
 steps:
+# 1. Checkout source
 - checkout: self
   clean: true
   fetchDepth: 1
+  displayName: Checkout repository
 
-# Cache Composer dependencies
+# 2. Update system packages
+- script: sudo apt-get update
+  displayName: Update package lists
+
+# 3. Install PHP with ALL required extensions
+- script: |
+    sudo apt-get install -y \
+      php php-cli php-mbstring php-xml php-curl php-zip \
+      php-bcmath php-intl php-gd \
+      unzip curl git python3-pip
+    php -v
+    echo "Installed extensions:"
+    php -m | grep -E 'bcmath|intl|gd|mbstring|xml|curl|zip'
+  displayName: Install PHP with extensions
+
+# 4. Install Composer
+- script: |
+    curl -sS https://getcomposer.org/installer | php
+    sudo mv composer.phar /usr/local/bin/composer
+    composer --version
+  displayName: Install Composer
+
+# 5. Cache Composer dependencies
 - task: Cache@2
   inputs:
     key: 'composer | "$(Agent.OS)" | composer.lock'
     path: vendor
-  displayName: Cache vendor
+  displayName: Cache vendor directory
 
+# 6. Install PHP dependencies
 - script: composer install --no-interaction --no-progress --prefer-dist
   displayName: Install dependencies
   condition: ne(variables['CacheRestored'], 'true')
 
+# 7. Security scans
 - script: composer audit || true
-  displayName: Security scan
+  displayName: Dependency security scan (SCA)
 
 - script: |
-    pip3 install --user semgrep 2>/dev/null || true
+    pip3 install --user semgrep
     ~/.local/bin/semgrep --config=auto || true
-  displayName: SAST
+  displayName: Static security scan (SAST)
 
+# 8. Create and publish artifact
 - task: ArchiveFiles@2
   inputs:
     rootFolderOrFile: .
     archiveFile: $(Build.ArtifactStagingDirectory)/akaunting.zip
-    
+    excludePaths: |
+      .git
+      .azure-pipelines
+      tests
+  displayName: Create build artifact
+
 - task: PublishBuildArtifacts@1
   inputs:
     PathtoPublish: $(Build.ArtifactStagingDirectory)
     ArtifactName: akaunting-build
+  displayName: Publish artifact
