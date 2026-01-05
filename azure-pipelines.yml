@@ -3,254 +3,218 @@ trigger:
 
 pool:
   name: test
+  clean: all  # <-- clean workspace before each run
 
 variables:
   phpVersion: '8.3'
   appName: 'akaunting-app'
 
+# ============================================
+# STAGE 1: BUILD & UNIT TESTS
+# ============================================
 stages:
-# ============================================
-# STAGE 1: BUILD & TEST
-# ============================================
-- stage: Build
+  - build
+  - security
+  - containerize
+  - deploy
+
+build:
+  stage: build
   displayName: 'Build & Unit Tests'
   jobs:
   - job: BuildJob
     displayName: 'Build Application'
     steps:
-    # Checkout
-    - checkout: self
-      clean: true
-      fetchDepth: 1
-      displayName: 'Checkout code'
+      # Checkout
+      - checkout: self
+        clean: true
+        fetchDepth: 1
+        displayName: 'Checkout code'
 
-    # System setup
-    - script: sudo apt-get update
-      displayName: 'Update package lists'
+      # System update & PHP setup
+      - script: |
+          sudo apt-get update
+          sudo apt-get install -y php php-cli php-mbstring php-xml php-curl php-zip \
+                                   php-bcmath php-intl php-gd php-mysql unzip curl git python3-pip
+          php -v
+        displayName: 'Install PHP & Dependencies'
 
-    # Install PHP with extensions
-    - script: |
-        sudo apt-get install -y \
-          php php-cli php-mbstring php-xml php-curl php-zip \
-          php-bcmath php-intl php-gd php-mysql \
-          unzip curl git python3-pip
-        php -v
-        php -m | grep -E 'bcmath|intl|gd'
-      displayName: 'Install PHP & Extensions'
+      # Composer installation
+      - script: |
+          curl -sS https://getcomposer.org/installer | php
+          sudo mv composer.phar /usr/local/bin/composer
+          composer --version
+        displayName: 'Install Composer'
 
-    # Install Composer
-    - script: |
-        curl -sS https://getcomposer.org/installer | php
-        sudo mv composer.phar /usr/local/bin/composer
-        composer --version
-      displayName: 'Install Composer'
+      # Cache composer dependencies
+      - task: Cache@2
+        inputs:
+          key: 'composer | "$(Agent.OS)" | composer.lock'
+          path: vendor
+        displayName: 'Cache Composer Packages'
 
-    # Cache dependencies
-    - task: Cache@2
-      inputs:
-        key: 'composer | "$(Agent.OS)" | composer.lock'
-        path: vendor
-      displayName: 'Cache Composer packages'
+      # Install project dependencies
+      - script: composer install --no-interaction --no-progress --prefer-dist
+        displayName: 'Install PHP Dependencies'
 
-    # Install dependencies
-    - script: composer install --no-interaction --no-progress --prefer-dist
-      displayName: 'Install PHP dependencies'
+      # Unit tests
+      - script: |
+          cp .env.example .env
+          php artisan key:generate
+          vendor/bin/phpunit --log-junit test-results.xml || true
+        displayName: 'Run Unit Tests'
 
-    # Run unit tests
-    - script: |
-        cp .env.example .env
-        php artisan key:generate
-        vendor/bin/phpunit --log-junit test-results.xml || true
-      displayName: 'Run Unit Tests'
+      # Publish test results
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: 'test-results.xml'
+          failTaskOnFailedTests: false
+        displayName: 'Publish Test Results'
+        condition: always()
 
-    # Publish test results
-    - task: PublishTestResults@2
-      inputs:
-        testResultsFormat: 'JUnit'
-        testResultsFiles: 'test-results.xml'
-        failTaskOnFailedTests: false
-      displayName: 'Publish Test Results'
-      condition: always()
+      # Archive application files (minimal, no Docker image)
+      - task: ArchiveFiles@2
+        inputs:
+          rootFolderOrFile: 'app'   # only app folder, not entire repo
+          includeRootFolder: false
+          archiveType: 'tar'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
+          replaceExistingArchive: true
+        displayName: 'Archive Application Files'
 
-    # Create application archive
-    - task: ArchiveFiles@2
-      inputs:
-        rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
-        includeRootFolder: false
-        archiveType: 'tar'
-        archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
-        replaceExistingArchive: true
-      displayName: 'Create application archive'
-
-    # Publish application artifact
-    - task: PublishBuildArtifacts@1
-      inputs:
-        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-        ArtifactName: 'app-files'
-      displayName: 'Publish application files'
+      # Publish application artifact
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: 'app-files'
+        displayName: 'Publish Application Files'
 
 # ============================================
-# STAGE 2: SECURITY SCANNING (DevSecOps)
+# STAGE 2: SECURITY SCANS
 # ============================================
-- stage: Security
+security:
+  stage: security
   displayName: 'Security Scanning'
   dependsOn: Build
   jobs:
-  - job: SecurityScans
+  - job: SecurityJob
     displayName: 'Run Security Scans'
     steps:
-    - checkout: self
-      displayName: 'Checkout code'
+      - checkout: self
 
-    # Install tools
-    - script: |
-        sudo apt-get update
-        sudo apt-get install -y php php-cli php-mbstring php-xml php-bcmath php-intl php-gd curl git python3-pip
-        curl -sS https://getcomposer.org/installer | php
-        sudo mv composer.phar /usr/local/bin/composer
-      displayName: 'Setup environment'
+      # Install tools
+      - script: |
+          sudo apt-get update
+          sudo apt-get install -y php php-cli php-mbstring php-xml php-bcmath php-intl php-gd curl git python3-pip
+          curl -sS https://getcomposer.org/installer | php
+          sudo mv composer.phar /usr/local/bin/composer
+        displayName: 'Setup Environment'
 
-    # Restore dependencies
-    - task: Cache@2
-      inputs:
-        key: 'composer | "$(Agent.OS)" | composer.lock'
-        path: vendor
-    - script: composer install --no-interaction --no-progress
-      displayName: 'Restore dependencies'
+      # Restore dependencies
+      - task: Cache@2
+        inputs:
+          key: 'composer | "$(Agent.OS)" | composer.lock'
+          path: vendor
+      - script: composer install --no-interaction --no-progress
+        displayName: 'Restore Dependencies'
 
-    # 1. SAST - Static Code Analysis (run BEFORE SCA)
-    - script: |
-        echo "=== Installing Semgrep ==="
-        pip3 install semgrep
-        echo "=== Running Semgrep SAST ==="
-        ~/.local/bin/semgrep --config=auto --json --output=semgrep-results.json || true
-        cat semgrep-results.json
-      displayName: '🔍 SAST - Static Application Security Testing'
-      continueOnError: true
+      # 1️⃣ SAST - Static Code Analysis
+      - script: |
+          pip3 install semgrep
+          semgrep --config=auto --json --output=semgrep-results.json || true
+          cat semgrep-results.json
+        displayName: '🔍 SAST - Static Code Analysis'
+        continueOnError: true
 
-    # 2. SCA - Dependency Check
-    - script: |
-        echo "=== Composer Security Audit ==="
-        composer audit --format=json > composer-audit.json || true
-        cat composer-audit.json
-      displayName: '🔍 SCA - Dependency Vulnerability Scan'
-      continueOnError: true
+      # 2️⃣ SCA - Dependency Check
+      - script: |
+          composer audit --format=json > composer-audit.json || true
+          cat composer-audit.json
+        displayName: '🔍 SCA - Dependency Vulnerability Scan'
+        continueOnError: true
 
-    # 3. Secret Scanning
-    - script: |
-        echo "=== Installing Gitleaks ==="
-        wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
-        tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
-        echo "=== Scanning for secrets ==="
-        ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || true
-        cat gitleaks-report.json
-      displayName: '🔍 Secret Scanning'
-      continueOnError: true
+      # 3️⃣ Secret scanning
+      - script: |
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
+          ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || true
+          cat gitleaks-report.json
+        displayName: '🔍 Secret Scanning'
+        continueOnError: true
 
-    # 4. Code Quality
-    - script: |
-        echo "=== Installing PHP_CodeSniffer ==="
-        composer require --dev squizlabs/php_codesniffer
-        echo "=== Running Code Quality Check ==="
-        vendor/bin/phpcs --standard=PSR12 --report=json --report-file=phpcs-report.json app/ || true
-      displayName: '🔍 Code Quality Analysis'
-      continueOnError: true
+      # 4️⃣ Code Quality
+      - script: |
+          composer require --dev squizlabs/php_codesniffer
+          vendor/bin/phpcs --standard=PSR12 --report=json --report-file=phpcs-report.json app/ || true
+        displayName: '🔍 Code Quality Analysis'
+        continueOnError: true
 
-    # Publish security reports
-    - task: PublishBuildArtifacts@1
-      inputs:
-        PathtoPublish: '.'
-        ArtifactName: 'security-reports'
-        publishLocation: 'Container'
-        includeRootFolder: false
-        StoreAsTar: false
-        parallel: true
-      displayName: 'Publish Security Reports'
+      # Publish security reports
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '.'
+          ArtifactName: 'security-reports'
+        displayName: 'Publish Security Reports'
 
 # ============================================
-# STAGE 3: DOCKER BUILD & CONTAINER SCANNING
+# STAGE 3: DOCKER BUILD & CONTAINER SCAN
 # ============================================
-- stage: Containerize
+containerize:
+  stage: containerize
   displayName: 'Docker Build & Scan'
   dependsOn: Security
   jobs:
-  - job: DockerBuild
-    displayName: 'Build & Scan Docker Image'
+  - job: DockerJob
+    displayName: 'Docker Build & Scan'
     steps:
-    - checkout: self
+      - checkout: self
 
-    # Build Docker image
-    - script: |
-        cat > Dockerfile << 'EOF'
-        FROM php:8.3-apache
-        
-        # Install dependencies
-        RUN apt-get update && apt-get install -y \
-            libpng-dev libjpeg-dev libfreetype6-dev \
-            libzip-dev libicu-dev libonig-dev \
-            git unzip curl \
-            && docker-php-ext-configure gd --with-freetype --with-jpeg \
-            && docker-php-ext-install -j$(nproc) \
-            bcmath gd intl mbstring pdo pdo_mysql zip
-        
-        # Enable Apache modules
-        RUN a2enmod rewrite
-        
-        # Copy application
-        COPY . /var/www/html
-        WORKDIR /var/www/html
-        
-        # Install Composer
-        COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-        RUN composer install --no-dev --optimize-autoloader
-        
-        # Set permissions
-        RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
-        
-        EXPOSE 80
-        CMD ["apache2-foreground"]
-        EOF
-        
-        docker build -t $(appName):$(Build.BuildId) .
-        docker tag $(appName):$(Build.BuildId) $(appName):latest
-      displayName: 'Build Docker Image'
+      # Build Docker image
+      - script: |
+          cat > Dockerfile << 'EOF'
+          FROM php:8.3-apache
+          RUN apt-get update && apt-get install -y \
+              libpng-dev libjpeg-dev libfreetype6-dev libzip-dev libicu-dev libonig-dev \
+              git unzip curl \
+              && docker-php-ext-configure gd --with-freetype --with-jpeg \
+              && docker-php-ext-install -j$(nproc) bcmath gd intl mbstring pdo pdo_mysql zip
+          RUN a2enmod rewrite
+          COPY . /var/www/html
+          WORKDIR /var/www/html
+          COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+          RUN composer install --no-dev --optimize-autoloader
+          RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
+          EXPOSE 80
+          CMD ["apache2-foreground"]
+          EOF
+          docker build -t $(appName):$(Build.BuildId) .
+          docker tag $(appName):$(Build.BuildId) $(appName):latest
+        displayName: 'Build Docker Image'
 
-    # Container security scan with Trivy
-    - script: |
-        echo "=== Installing Trivy ==="
-        wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
-        sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
-        
-        echo "=== Scanning Docker image ==="
-        trivy image --format json --output trivy-report.json $(appName):$(Build.BuildId) || true
-        trivy image $(appName):$(Build.BuildId)
-      displayName: '🔍 Container Security Scan (Trivy)'
-      continueOnError: true
+      # Scan Docker image
+      - script: |
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
+          trivy image --format json --output trivy-report.json $(appName):$(Build.BuildId) || true
+          trivy image $(appName):$(Build.BuildId)
+        displayName: '🔍 Container Security Scan'
+        continueOnError: true
 
-    # Publish Trivy report
-    - task: PublishBuildArtifacts@1
-      inputs:
-        PathtoPublish: 'trivy-report.json'
-        ArtifactName: 'container-security-report'
-      displayName: 'Publish Trivy Report'
-
-    # Save Docker image as tar (OPTIONAL: remove if slow)
-    #- script: |
-    #    docker save $(appName):$(Build.BuildId) | gzip > $(Build.ArtifactStagingDirectory)/docker-image.tar.gz
-    #  displayName: 'Save Docker Image'
-    #
-    #- task: PublishBuildArtifacts@1
-    #  inputs:
-    #    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-    #    ArtifactName: 'docker-image'
-    #  displayName: 'Publish Docker Image'
+      # Publish Trivy report
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: 'trivy-report.json'
+          ArtifactName: 'container-security-report'
+        displayName: 'Publish Trivy Report'
 
 # ============================================
-# STAGE 4: DEPLOYMENT TO AZURE WEB APP
+# STAGE 4: DEPLOY TO AZURE WEB APP
 # ============================================
-- stage: Deploy
+deploy:
+  stage: deploy
   displayName: 'Deploy to Azure'
-  dependsOn: Containerize
+  dependsOn: containerize
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
   jobs:
   - deployment: DeployToAzure
@@ -260,60 +224,51 @@ stages:
       runOnce:
         deploy:
           steps:
-          - download: current
-            artifact: app-files
-          
-          # Deploy using Azure Web App for Containers
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: 'azure-akaunting-connection'
-              scriptType: 'bash'
-              scriptLocation: 'inlineScript'
-              inlineScript: |
-                RESOURCE_GROUP="akaunting-rg"
-                APP_NAME="akaunting-webapp-$(Build.BuildId)"
-                LOCATION="eastus"
-                
-                echo "Creating Azure App Service Plan..."
-                az appservice plan create \
-                  --name "${APP_NAME}-plan" \
-                  --resource-group $RESOURCE_GROUP \
-                  --location $LOCATION \
-                  --is-linux \
-                  --sku F1 || true
-                
-                echo "Creating Web App..."
-                az webapp create \
-                  --resource-group $RESOURCE_GROUP \
-                  --plan "${APP_NAME}-plan" \
-                  --name $APP_NAME \
-                  --runtime "PHP:8.3"
-                
-                echo "Configuring Web App..."
-                az webapp config appsettings set \
-                  --resource-group $RESOURCE_GROUP \
-                  --name $APP_NAME \
-                  --settings \
-                    APP_ENV=production \
-                    APP_DEBUG=false \
-                    WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
-                
-                # Deploy application files
-                cd $(Pipeline.Workspace)/app-files
-                tar -xzf app.tar.gz -C /tmp/app-deploy
-                cd /tmp/app-deploy
-                zip -r deploy.zip .
-                
-                az webapp deployment source config-zip \
-                  --resource-group $RESOURCE_GROUP \
-                  --name $APP_NAME \
-                  --src deploy.zip
-                
-                APP_URL=$(az webapp show \
-                  --resource-group $RESOURCE_GROUP \
-                  --name $APP_NAME \
-                  --query defaultHostName -o tsv)
-                
-                echo "✅ Application deployed successfully!"
-                echo "Access your app at: https://$APP_URL"
-            displayName: 'Deploy to Azure Web App'
+            - download: current
+              artifact: docker-image
+            - download: current
+              artifact: app-files
+            # Deploy using Azure CLI
+            - task: AzureCLI@2
+              inputs:
+                azureSubscription: 'azure-akaunting-connection'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  RESOURCE_GROUP="akaunting-rg"
+                  APP_NAME="akaunting-webapp-$(Build.BuildId)"
+                  LOCATION="eastus"
+                  # Create App Service Plan
+                  az appservice plan create \
+                    --name "${APP_NAME}-plan" \
+                    --resource-group $RESOURCE_GROUP \
+                    --location $LOCATION \
+                    --is-linux \
+                    --sku F1 || true
+                  # Create Web App
+                  az webapp create \
+                    --resource-group $RESOURCE_GROUP \
+                    --plan "${APP_NAME}-plan" \
+                    --name $APP_NAME \
+                    --runtime "PHP:8.3"
+                  # Configure app settings
+                  az webapp config appsettings set \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $APP_NAME \
+                    --settings APP_ENV=production APP_DEBUG=false WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
+                  # Deploy app files
+                  cd $(Pipeline.Workspace)/app-files
+                  tar -xzf app.tar.gz -C /tmp/app-deploy
+                  cd /tmp/app-deploy
+                  zip -r deploy.zip .
+                  az webapp deployment source config-zip \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $APP_NAME \
+                    --src deploy.zip
+                  # Get URL
+                  APP_URL=$(az webapp show \
+                    --resource-group $RESOURCE_GROUP \
+                    --name $APP_NAME \
+                    --query defaultHostName -o tsv)
+                  echo "✅ Application deployed successfully! Access at: https://$APP_URL"
+              displayName: 'Deploy to Azure Web App'
