@@ -3,260 +3,230 @@ trigger:
 
 pool:
   name: test
-  clean: all  # <-- clean workspace before each run
+  clean: all
 
 variables:
   phpVersion: '8.3'
   appName: 'akaunting-app'
 
-# ============================================
-# STAGE 1: BUILD & UNIT TESTS
-# ============================================
 stages:
-  - build
-  - security
-  - containerize
-  - deploy
-
-build:
-  stage: build
+# =====================================================
+# STAGE 1: BUILD & UNIT TESTS
+# =====================================================
+- stage: build
   displayName: 'Build & Unit Tests'
   jobs:
   - job: BuildJob
     displayName: 'Build Application'
     steps:
-      # Checkout
       - checkout: self
         clean: true
         fetchDepth: 1
-        displayName: 'Checkout code'
+        displayName: 'Checkout Source Code'
 
-      # System update & PHP setup
       - script: |
           sudo apt-get update
-          sudo apt-get install -y php php-cli php-mbstring php-xml php-curl php-zip \
-                                   php-bcmath php-intl php-gd php-mysql unzip curl git python3-pip
+          sudo apt-get install -y \
+            php php-cli php-mbstring php-xml php-curl php-zip \
+            php-bcmath php-intl php-gd php-mysql \
+            unzip curl git python3 python3-venv
           php -v
-        displayName: 'Install PHP & Dependencies'
+        displayName: 'Install PHP & System Dependencies'
 
-      # Composer installation
       - script: |
           curl -sS https://getcomposer.org/installer | php
           sudo mv composer.phar /usr/local/bin/composer
           composer --version
         displayName: 'Install Composer'
 
-      # Cache composer dependencies
       - task: Cache@2
         inputs:
           key: 'composer | "$(Agent.OS)" | composer.lock'
           path: vendor
-        displayName: 'Cache Composer Packages'
+        displayName: 'Cache Composer Dependencies'
 
-      # Install project dependencies
       - script: composer install --no-interaction --no-progress --prefer-dist
-        displayName: 'Install PHP Dependencies'
+        displayName: 'Install Project Dependencies'
 
-      # Unit tests
       - script: |
           cp .env.example .env
           php artisan key:generate
           vendor/bin/phpunit --log-junit test-results.xml || true
         displayName: 'Run Unit Tests'
 
-      # Publish test results
       - task: PublishTestResults@2
         inputs:
           testResultsFormat: 'JUnit'
           testResultsFiles: 'test-results.xml'
           failTaskOnFailedTests: false
-        displayName: 'Publish Test Results'
+        displayName: 'Publish Unit Test Results'
         condition: always()
 
-      # Archive application files (minimal, no Docker image)
       - task: ArchiveFiles@2
         inputs:
-          rootFolderOrFile: 'app'   # only app folder, not entire repo
+          rootFolderOrFile: 'app'
           includeRootFolder: false
           archiveType: 'tar'
           archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
           replaceExistingArchive: true
         displayName: 'Archive Application Files'
 
-      # Publish application artifact
       - task: PublishBuildArtifacts@1
         inputs:
           PathtoPublish: '$(Build.ArtifactStagingDirectory)'
           ArtifactName: 'app-files'
-        displayName: 'Publish Application Files'
+        displayName: 'Publish Build Artifacts'
 
-# ============================================
+# =====================================================
 # STAGE 2: SECURITY SCANS
-# ============================================
-security:
-  stage: security
+# =====================================================
+- stage: security
   displayName: 'Security Scanning'
-  dependsOn: Build
+  dependsOn: build
   jobs:
   - job: SecurityJob
-    displayName: 'Run Security Scans'
+    displayName: 'Application Security Analysis'
     steps:
       - checkout: self
 
-      # Install tools
       - script: |
           sudo apt-get update
-          sudo apt-get install -y php php-cli php-mbstring php-xml php-bcmath php-intl php-gd curl git python3-pip
+          sudo apt-get install -y \
+            php php-cli php-mbstring php-xml php-bcmath php-intl php-gd \
+            curl git python3 python3-venv
           curl -sS https://getcomposer.org/installer | php
           sudo mv composer.phar /usr/local/bin/composer
-        displayName: 'Setup Environment'
+        displayName: 'Prepare Security Scan Environment'
 
-      # Restore dependencies
       - task: Cache@2
         inputs:
           key: 'composer | "$(Agent.OS)" | composer.lock'
           path: vendor
+
       - script: composer install --no-interaction --no-progress
         displayName: 'Restore Dependencies'
 
-      # 1️⃣ SAST - Static Code Analysis
+      # 🔍 SAST – Static Application Security Testing
       - script: |
-          pip3 install semgrep
-          semgrep --config=auto --json --output=semgrep-results.json || true
-          cat semgrep-results.json
-        displayName: '🔍 SAST - Static Code Analysis'
+          python3 -m venv semgrep-venv
+          source semgrep-venv/bin/activate
+          pip install --upgrade pip
+          pip install semgrep
+          semgrep scan --config=auto --json --output=semgrep-results.json || true
+        displayName: '🔍 SAST – Semgrep'
         continueOnError: true
 
-      # 2️⃣ SCA - Dependency Check
+      # 🔍 SCA – Dependency Vulnerability Scan
       - script: |
           composer audit --format=json > composer-audit.json || true
-          cat composer-audit.json
-        displayName: '🔍 SCA - Dependency Vulnerability Scan'
+        displayName: '🔍 SCA – Composer Audit'
         continueOnError: true
 
-      # 3️⃣ Secret scanning
+      # 🔍 Secret Scanning
       - script: |
           wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
           tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
-          ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || true
-          cat gitleaks-report.json
-        displayName: '🔍 Secret Scanning'
+          ./gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --no-git || true
+        displayName: '🔍 Secret Scanning – Gitleaks'
         continueOnError: true
 
-      # 4️⃣ Code Quality
+      # 🔍 Code Quality
       - script: |
           composer require --dev squizlabs/php_codesniffer
-          vendor/bin/phpcs --standard=PSR12 --report=json --report-file=phpcs-report.json app/ || true
-        displayName: '🔍 Code Quality Analysis'
+          vendor/bin/phpcs \
+            --standard=PSR12 \
+            --report=json \
+            --report-file=phpcs-report.json \
+            app/ || true
+        displayName: '🔍 Code Quality – PHP_CodeSniffer'
         continueOnError: true
 
-      # Publish security reports
       - task: PublishBuildArtifacts@1
         inputs:
           PathtoPublish: '.'
           ArtifactName: 'security-reports'
         displayName: 'Publish Security Reports'
 
-# ============================================
+# =====================================================
 # STAGE 3: DOCKER BUILD & CONTAINER SCAN
-# ============================================
-containerize:
-  stage: containerize
-  displayName: 'Docker Build & Scan'
-  dependsOn: Security
+# =====================================================
+- stage: containerize
+  displayName: 'Docker Build & Container Scan'
+  dependsOn: security
   jobs:
   - job: DockerJob
     displayName: 'Docker Build & Scan'
     steps:
       - checkout: self
 
-      # Build Docker image
       - script: |
-          cat > Dockerfile << 'EOF'
-          FROM php:8.3-apache
-          RUN apt-get update && apt-get install -y \
-              libpng-dev libjpeg-dev libfreetype6-dev libzip-dev libicu-dev libonig-dev \
-              git unzip curl \
-              && docker-php-ext-configure gd --with-freetype --with-jpeg \
-              && docker-php-ext-install -j$(nproc) bcmath gd intl mbstring pdo pdo_mysql zip
-          RUN a2enmod rewrite
-          COPY . /var/www/html
-          WORKDIR /var/www/html
-          COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-          RUN composer install --no-dev --optimize-autoloader
-          RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
-          EXPOSE 80
-          CMD ["apache2-foreground"]
-          EOF
           docker build -t $(appName):$(Build.BuildId) .
           docker tag $(appName):$(Build.BuildId) $(appName):latest
         displayName: 'Build Docker Image'
 
-      # Scan Docker image
       - script: |
           wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
           sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
           trivy image --format json --output trivy-report.json $(appName):$(Build.BuildId) || true
-          trivy image $(appName):$(Build.BuildId)
-        displayName: '🔍 Container Security Scan'
+        displayName: '🔍 Container Vulnerability Scan – Trivy'
         continueOnError: true
 
-      # Publish Trivy report
       - task: PublishBuildArtifacts@1
         inputs:
           PathtoPublish: 'trivy-report.json'
           ArtifactName: 'container-security-report'
-        displayName: 'Publish Trivy Report'
+        displayName: 'Publish Container Scan Report'
 
-# ============================================
-# STAGE 4: DEPLOY TO AZURE WEB APP
-# ============================================
-deploy:
-  stage: deploy
+# =====================================================
+# STAGE 4: DEPLOY TO AZURE
+# =====================================================
+- stage: deploy
   displayName: 'Deploy to Azure'
   dependsOn: containerize
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
   jobs:
   - deployment: DeployToAzure
-    displayName: 'Deploy to Azure Web App'
+    displayName: 'Azure Web App Deployment'
     environment: 'production'
     strategy:
       runOnce:
         deploy:
           steps:
             - download: current
-              artifact: docker-image
-            - download: current
               artifact: app-files
-            # Deploy using Azure CLI
+
             - task: AzureCLI@2
               inputs:
                 azureSubscription: 'azure-akaunting-connection'
-                scriptType: 'bash'
-                scriptLocation: 'inlineScript'
+                scriptType: bash
+                scriptLocation: inlineScript
                 inlineScript: |
                   RESOURCE_GROUP="akaunting-rg"
                   APP_NAME="akaunting-webapp-$(Build.BuildId)"
                   LOCATION="eastus"
-                  # Create App Service Plan
+
                   az appservice plan create \
                     --name "${APP_NAME}-plan" \
                     --resource-group $RESOURCE_GROUP \
                     --location $LOCATION \
                     --is-linux \
                     --sku F1 || true
-                  # Create Web App
+
                   az webapp create \
                     --resource-group $RESOURCE_GROUP \
                     --plan "${APP_NAME}-plan" \
                     --name $APP_NAME \
                     --runtime "PHP:8.3"
-                  # Configure app settings
+
                   az webapp config appsettings set \
                     --resource-group $RESOURCE_GROUP \
                     --name $APP_NAME \
-                    --settings APP_ENV=production APP_DEBUG=false WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
-                  # Deploy app files
+                    --settings APP_ENV=production APP_DEBUG=false
+
                   cd $(Pipeline.Workspace)/app-files
                   tar -xzf app.tar.gz -C /tmp/app-deploy
                   cd /tmp/app-deploy
@@ -265,10 +235,3 @@ deploy:
                     --resource-group $RESOURCE_GROUP \
                     --name $APP_NAME \
                     --src deploy.zip
-                  # Get URL
-                  APP_URL=$(az webapp show \
-                    --resource-group $RESOURCE_GROUP \
-                    --name $APP_NAME \
-                    --query defaultHostName -o tsv)
-                  echo "✅ Application deployed successfully! Access at: https://$APP_URL"
-              displayName: 'Deploy to Azure Web App'
