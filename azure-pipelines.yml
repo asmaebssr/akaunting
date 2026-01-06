@@ -196,7 +196,7 @@ stages:
                     --resource-group $RESOURCE_GROUP \
                     --location $LOCATION \
                     --is-linux \
-                    --sku F1 || true
+                    --sku B1 || true
 
                   az webapp create \
                     --resource-group $RESOURCE_GROUP \
