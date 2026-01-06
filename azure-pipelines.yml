@@ -46,7 +46,7 @@ stages:
         displayName: 'Cache Composer Dependencies'
 
       - script: composer install --no-interaction --no-progress --prefer-dist
-        displayName: 'Install Project Dependencies'
+        displayName: 'Install Dependencies'
 
       - script: |
           cp .env.example .env
@@ -69,13 +69,13 @@ stages:
           archiveType: 'tar'
           archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
           replaceExistingArchive: true
-        displayName: 'Archive Application Files'
+        displayName: 'Archive Application'
 
       - task: PublishBuildArtifacts@1
         inputs:
-          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
           ArtifactName: 'app-files'
-        displayName: 'Publish Build Artifacts'
+        displayName: 'Publish Application Artifact'
 
 # =====================================================
 # STAGE 2: SECURITY SCANS
@@ -94,9 +94,7 @@ stages:
           sudo apt-get install -y \
             php php-cli php-mbstring php-xml php-bcmath php-intl php-gd \
             curl git python3 python3-venv
-          curl -sS https://getcomposer.org/installer | php
-          sudo mv composer.phar /usr/local/bin/composer
-        displayName: 'Prepare Security Scan Environment'
+        displayName: 'Prepare Environment'
 
       - task: Cache@2
         inputs:
@@ -106,48 +104,62 @@ stages:
       - script: composer install --no-interaction --no-progress
         displayName: 'Restore Dependencies'
 
-      # 🔍 SAST – Static Application Security Testing
+      # SAST – Semgrep
       - script: |
           python3 -m venv semgrep-venv
           source semgrep-venv/bin/activate
           pip install --upgrade pip
           pip install semgrep
-          semgrep scan --config=auto --json --output=semgrep-results.json || true
-        displayName: '🔍 SAST – Semgrep'
-        continueOnError: true
+          semgrep scan --config=auto --json --output=semgrep.json || true
+        displayName: 'SAST – Semgrep'
 
-      # 🔍 SCA – Dependency Vulnerability Scan
+      # SCA – Composer Audit
       - script: |
           composer audit --format=json > composer-audit.json || true
-        displayName: '🔍 SCA – Composer Audit'
-        continueOnError: true
+        displayName: 'SCA – Composer Audit'
 
-      # 🔍 Secret Scanning
+      # Secret Scanning – Gitleaks
       - script: |
           wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
           tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
           ./gitleaks detect \
             --source . \
             --report-format json \
-            --report-path gitleaks-report.json \
+            --report-path gitleaks.json \
             --no-git || true
-        displayName: '🔍 Secret Scanning – Gitleaks'
-        continueOnError: true
+        displayName: 'Secret Scanning – Gitleaks'
 
-      # 🔍 Code Quality
+      # Code Quality – PHP_CodeSniffer
       - script: |
           composer require --dev squizlabs/php_codesniffer
           vendor/bin/phpcs \
             --standard=PSR12 \
             --report=json \
-            --report-file=phpcs-report.json \
+            --report-file=phpcs.json \
             app/ || true
-        displayName: '🔍 Code Quality – PHP_CodeSniffer'
-        continueOnError: true
+        displayName: 'Code Quality – PHPCS'
+
+      # Collect & Archive Security Reports
+      - script: |
+          mkdir security-reports
+          mv semgrep.json security-reports/ || true
+          mv composer-audit.json security-reports/ || true
+          mv gitleaks.json security-reports/ || true
+          mv phpcs.json security-reports/ || true
+        displayName: 'Collect Security Reports'
+
+      - task: ArchiveFiles@2
+        inputs:
+          rootFolderOrFile: 'security-reports'
+          includeRootFolder: false
+          archiveType: zip
+          archiveFile: '$(Build.ArtifactStagingDirectory)/security-reports.zip'
+          replaceExistingArchive: true
+        displayName: 'Archive Security Reports'
 
       - task: PublishBuildArtifacts@1
         inputs:
-          PathtoPublish: '.'
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/security-reports.zip'
           ArtifactName: 'security-reports'
         displayName: 'Publish Security Reports'
 
@@ -171,15 +183,14 @@ stages:
       - script: |
           wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
           sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
-          trivy image --format json --output trivy-report.json $(appName):$(Build.BuildId) || true
-        displayName: '🔍 Container Vulnerability Scan – Trivy'
-        continueOnError: true
+          trivy image --format json --output trivy.json $(appName):$(Build.BuildId) || true
+        displayName: 'Container Scan – Trivy'
 
       - task: PublishBuildArtifacts@1
         inputs:
-          PathtoPublish: 'trivy-report.json'
+          PathtoPublish: 'trivy.json'
           ArtifactName: 'container-security-report'
-        displayName: 'Publish Container Scan Report'
+        displayName: 'Publish Container Report'
 
 # =====================================================
 # STAGE 4: DEPLOY TO AZURE
@@ -227,8 +238,8 @@ stages:
                     --name $APP_NAME \
                     --settings APP_ENV=production APP_DEBUG=false
 
-                  cd $(Pipeline.Workspace)/app-files
-                  tar -xzf app.tar.gz -C /tmp/app-deploy
+                  mkdir -p /tmp/app-deploy
+                  tar -xzf $(Pipeline.Workspace)/app-files/app.tar.gz -C /tmp/app-deploy
                   cd /tmp/app-deploy
                   zip -r deploy.zip .
                   az webapp deployment source config-zip \
