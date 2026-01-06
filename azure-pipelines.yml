@@ -29,7 +29,7 @@ stages:
           sudo apt-get install -y \
             php php-cli php-mbstring php-xml php-curl php-zip \
             php-bcmath php-intl php-gd php-mysql \
-            unzip curl git python3 python3-venv
+            unzip curl git
           php -v
         displayName: 'Install PHP & System Dependencies'
 
@@ -59,33 +59,33 @@ stages:
           testResultsFormat: 'JUnit'
           testResultsFiles: 'test-results.xml'
           failTaskOnFailedTests: false
-        displayName: 'Publish Unit Test Results'
         condition: always()
+        displayName: 'Publish Test Results'
 
       - task: ArchiveFiles@2
         inputs:
-          rootFolderOrFile: 'app'
+          rootFolderOrFile: '.'
           includeRootFolder: false
-          archiveType: 'tar'
-          archiveFile: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
+          archiveType: zip
+          archiveFile: '$(Build.ArtifactStagingDirectory)/akaunting.zip'
           replaceExistingArchive: true
-        displayName: 'Archive Application'
+        displayName: 'Package Application'
 
       - task: PublishBuildArtifacts@1
         inputs:
-          PathtoPublish: '$(Build.ArtifactStagingDirectory)/app.tar.gz'
-          ArtifactName: 'app-files'
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/akaunting.zip'
+          ArtifactName: 'application'
         displayName: 'Publish Application Artifact'
 
 # =====================================================
-# STAGE 2: SECURITY SCANS
+# STAGE 2: SECURITY SCANS (DEVSECOPS CORE)
 # =====================================================
 - stage: security
   displayName: 'Security Scanning'
   dependsOn: build
   jobs:
   - job: SecurityJob
-    displayName: 'Application Security Analysis'
+    displayName: 'Static & Dependency Security Analysis'
     steps:
       - checkout: self
 
@@ -94,12 +94,13 @@ stages:
           sudo apt-get install -y \
             php php-cli php-mbstring php-xml php-bcmath php-intl php-gd \
             curl git python3 python3-venv
-        displayName: 'Prepare Environment'
+        displayName: 'Prepare Security Environment'
 
       - task: Cache@2
         inputs:
           key: 'composer | "$(Agent.OS)" | composer.lock'
           path: vendor
+        displayName: 'Restore Composer Cache'
 
       - script: composer install --no-interaction --no-progress
         displayName: 'Restore Dependencies'
@@ -108,7 +109,6 @@ stages:
       - script: |
           python3 -m venv semgrep-venv
           source semgrep-venv/bin/activate
-          pip install --upgrade pip
           pip install semgrep
           semgrep scan --config=auto --json --output=semgrep.json || true
         displayName: 'SAST – Semgrep'
@@ -118,7 +118,7 @@ stages:
           composer audit --format=json > composer-audit.json || true
         displayName: 'SCA – Composer Audit'
 
-      # Secret Scanning – Gitleaks
+      # Secret Detection – Gitleaks
       - script: |
           wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
           tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
@@ -129,7 +129,7 @@ stages:
             --no-git || true
         displayName: 'Secret Scanning – Gitleaks'
 
-      # Code Quality – PHP_CodeSniffer
+      # Code Quality
       - script: |
           composer require --dev squizlabs/php_codesniffer
           vendor/bin/phpcs \
@@ -139,7 +139,7 @@ stages:
             app/ || true
         displayName: 'Code Quality – PHPCS'
 
-      # Collect & Archive Security Reports
+      # Collect & Publish Security Reports
       - script: |
           mkdir security-reports
           mv semgrep.json security-reports/ || true
@@ -164,40 +164,11 @@ stages:
         displayName: 'Publish Security Reports'
 
 # =====================================================
-# STAGE 3: DOCKER BUILD & CONTAINER SCAN
-# =====================================================
-- stage: containerize
-  displayName: 'Docker Build & Container Scan'
-  dependsOn: security
-  jobs:
-  - job: DockerJob
-    displayName: 'Docker Build & Scan'
-    steps:
-      - checkout: self
-
-      - script: |
-          docker build -t $(appName):$(Build.BuildId) .
-          docker tag $(appName):$(Build.BuildId) $(appName):latest
-        displayName: 'Build Docker Image'
-
-      - script: |
-          wget https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.deb
-          sudo dpkg -i trivy_0.48.0_Linux-64bit.deb
-          trivy image --format json --output trivy.json $(appName):$(Build.BuildId) || true
-        displayName: 'Container Scan – Trivy'
-
-      - task: PublishBuildArtifacts@1
-        inputs:
-          PathtoPublish: 'trivy.json'
-          ArtifactName: 'container-security-report'
-        displayName: 'Publish Container Report'
-
-# =====================================================
-# STAGE 4: DEPLOY TO AZURE
+# STAGE 3: DEPLOY TO AZURE WEB APP (PHP)
 # =====================================================
 - stage: deploy
   displayName: 'Deploy to Azure'
-  dependsOn: containerize
+  dependsOn: security
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
   jobs:
   - deployment: DeployToAzure
@@ -208,7 +179,7 @@ stages:
         deploy:
           steps:
             - download: current
-              artifact: app-files
+              artifact: application
 
             - task: AzureCLI@2
               inputs:
@@ -238,11 +209,7 @@ stages:
                     --name $APP_NAME \
                     --settings APP_ENV=production APP_DEBUG=false
 
-                  mkdir -p /tmp/app-deploy
-                  tar -xzf $(Pipeline.Workspace)/app-files/app.tar.gz -C /tmp/app-deploy
-                  cd /tmp/app-deploy
-                  zip -r deploy.zip .
                   az webapp deployment source config-zip \
                     --resource-group $RESOURCE_GROUP \
                     --name $APP_NAME \
-                    --src deploy.zip
+                    --src $(Pipeline.Workspace)/application/akaunting.zip
